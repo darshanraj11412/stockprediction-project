@@ -1,229 +1,304 @@
-# app.py — Optimized Streamlit app with multi-step forecasting + improved UI + Fix 1 (yfinance reliability)
+# app.py — Streamlit app with LSTM forecasting integrated
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import joblib
 import os
-import yfinance as yf
 from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
-import plotly.express as px
 import plotly.graph_objects as go
 
-# Try import TensorFlow for LSTM support — optional
+# Try import tensorflow (for LSTM)
 try:
     import tensorflow as tf
-    from tensorflow.keras.models import load_model
-    TENSORFLOW_AVAILABLE = True
-except Exception:
-    TENSORFLOW_AVAILABLE = False
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+except Exception as e:
+    tf = None
 
-# ---------- Page config ----------
-st.set_page_config(page_title="Stock Prediction App",
-                   page_icon="📈",
-                   layout="wide",
-                   initial_sidebar_state="expanded")
+st.set_page_config(layout="wide")
+st.title("Stock Trend + LSTM Forecasting")
+
+# -----------------------
+# User inputs / UI
+# -----------------------
+col1, col2, col3 = st.columns([2,1,1])
+with col1:
+    ticker = st.text_input("Enter Stock Ticker (Yahoo format)", value="AAPL")
+with col2:
+    history_years = st.selectbox("History length (years)", [0.5, 1, 2, 3], index=1)  # 0.5 = 6 months
+with col3:
+    forecast_days = st.selectbox("Forecast days", [7, 15, 30], index=2)
+
+retrain = st.checkbox("Loaded existing LSTM model for faster and accuracy prediction!", value=False)
+
+run = st.button("Run Forecast")
+
+# helper paths
+BASE_DIR = os.path.dirname(__file__)
+LSTM_MODEL_PATH = os.path.join(BASE_DIR, "lstm_model.h5")
+CLASSIFIER_MODEL_PATH = os.path.join(BASE_DIR, "stock_model.joblib")
+
+# -----------------------
+# Utility functions
+# -----------------------
+def download_data(ticker_symbol: str, min_rows: int = 300):
+    years = 3
+    while True:
+        end = datetime.today()
+        start = end - timedelta(days=int(365 * years))
+        df = yf.download(ticker_symbol, start=start, end=end, progress=False)
+
+        if df.shape[0] >= min_rows or years > 10:
+            return df
+
+        years += 1  # Auto increase dataset until enough rows
 
 
-# ---------- FIX 1: Improved Yahoo fetch ----------
-@st.cache_data(ttl=60*60)  # cache data for one hour
-def fetch_history(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    """
-    Improved Yahoo Finance fetch with retries + safe fallback.
-    Fix 1 applied.
-    """
-    import yfinance as yf
-    from yfinance import shared
-
-    yf.pdr_override()           # enable auto retry
-    shared._DEFAULT_USER_AGENT = "Mozilla/5.0"   # change UA to avoid blocks
-
-    try:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            progress=False,
-            threads=False,       # MUST disable threads for Streamlit Cloud
-            auto_adjust=False,
-            repair=True
-        )
-    except Exception as e:
-        st.error(f"Yahoo blocked the request: {e}")
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.reset_index()
-    df["Date"] = pd.to_datetime(df["Date"])
+def make_indicators(df: pd.DataFrame):
+    df = df.copy()
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACDsig'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['RSI'] = 100 - (100 / (1 + df['Close'].pct_change().rolling(14).mean()))
+    df = df.fillna(method='ffill').fillna(method='bfill')
     return df
 
-
-# ---------- Helper functions ----------
-@st.cache_resource
-def load_joblib_model(path: str):
-    if os.path.exists(path):
-        return joblib.load(path)
-    return None
-
-@st.cache_resource
-def load_tf_model(path: str):
-    if os.path.exists(path):
-        try:
-            return load_model(path)
-        except Exception:
-            return None
-    return None
-
-def safe_inverse_transform(scaler, arr):
-    if scaler is None:
-        return arr
-    arr_2d = np.array(arr).reshape(-1, 1)
-    return scaler.inverse_transform(arr_2d).flatten()
-
-def prepare_series_for_model(series: pd.Series, window: int):
-    arr = series.values.reshape(-1, 1)
-    scaler = MinMaxScaler()
-    arr_s = scaler.fit_transform(arr)
-
+def create_sequences(values, lookback=60):
     X, y = [], []
-    for i in range(window, len(arr_s)):
-        X.append(arr_s[i-window:i, 0])
-        y.append(arr_s[i, 0])
+    for i in range(lookback, len(values)):
+        X.append(values[i-lookback:i, 0])
+        y.append(values[i, 0])
+    X, y = np.array(X), np.array(y)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    return X, y
 
-    X = np.array(X)
-    y = np.array(y)
-    X_lstm = X.reshape((X.shape[0], X.shape[1], 1))
-    return X, X_lstm, y, scaler
+def build_lstm(lookback=60):
+    model = Sequential()
+    model.add(LSTM(64, input_shape=(lookback,1), return_sequences=True))
+    model.add(Dropout(0.15))
+    model.add(LSTM(32, return_sequences=False))
+    model.add(Dropout(0.10))
+    model.add(Dense(16, activation='relu'))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='mse')
+    return model
 
-def recursive_forecast(last_window, model, scaler, steps=7, is_lstm=False):
-    preds_scaled = []
-    window = len(last_window)
-    window_arr = last_window.copy().tolist()
+def iterative_forecast(model, last_sequence, scaler, days, lookback=60):
+    seq = last_sequence.copy()  # scaled values shape (lookback, 1)
+    preds = []
+    for _ in range(days):
+        x = seq[-lookback:].reshape(1, lookback, 1)
+        p = model.predict(x, verbose=0)[0,0]
+        preds.append(p)
+        seq = np.append(seq, [[p]], axis=0)
+    preds = np.array(preds).reshape(-1,1)
+    preds = scaler.inverse_transform(preds).flatten()
+    return preds
 
-    for i in range(steps):
-        if is_lstm:
-            x_in = np.array(window_arr[-window:]).reshape(1, window, 1)
-        else:
-            x_in = np.array(window_arr[-window:]).reshape(1, window)
+# -----------------------
+# Main app logic
+# -----------------------
+if run:
+    if ticker.strip() == "":
+        st.error("Please enter a valid ticker.")
+        st.stop()
 
-        p = model.predict(x_in, verbose=0)
-        p_val = float(np.array(p).flatten()[0])
-        preds_scaled.append(p_val)
+    with st.spinner("Downloading price data..."):
+        data = download_data(ticker.strip(), history_years)
 
-        window_arr.append(p_val)
+    if data.empty:
+        st.error("No data returned for ticker. Check ticker symbol / exchange suffix (eg. INFY.NS).")
+        st.stop()
 
-    preds_original = safe_inverse_transform(scaler, preds_scaled)
-    return preds_original
+    # -----------------------
+    # Ensure indicators exist before plotting
+    data = make_indicators(data)
+
+    # -----------------------
+    # Historical Price + Indicators Graph
+    # -----------------------
+    st.subheader(f"{ticker.upper()} — Historical Price & Indicators")
+    price_col, ind_col = st.columns([2,1])
+
+    with price_col:
+        fig_hist = go.Figure()
+        # Close Price
+        fig_hist.add_trace(go.Scatter(
+            x=data.index, y=data['Close'],
+            mode='lines', name='Close',
+            line=dict(color='blue', width=2)
+        ))
+        # EMA20
+        fig_hist.add_trace(go.Scatter(
+            x=data.index, y=data['EMA20'],
+            mode='lines', name='EMA20',
+            line=dict(color='orange', width=1, dash='dot')
+        ))
+        # EMA50
+        fig_hist.add_trace(go.Scatter(
+            x=data.index, y=data['EMA50'],
+            mode='lines', name='EMA50',
+            line=dict(color='green', width=1, dash='dot')
+        ))
+        # RSI on secondary y-axis
+        fig_hist.add_trace(go.Scatter(
+            x=data.index, y=data['RSI'],
+            mode='lines', name='RSI',
+            yaxis='y2',
+            line=dict(color='purple', width=1)
+        ))
+        fig_hist.update_layout(
+            title=f"{ticker.upper()} — Price & Indicators",
+            xaxis_title="Date",
+            yaxis_title="Price",
+            yaxis2=dict(title="RSI", overlaying="y", side="right"),
+            template="plotly_white",
+            height=500
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    # Indicators table on the side
+    with ind_col:
+        st.write("Latest indicators")
+        st.write(data[['Close','EMA20','EMA50','RSI','MACD','MACDsig']].tail(3))
 
 
-# ---------- Sidebar ----------
-st.sidebar.title("📈 Stock Prediction")
-st.sidebar.markdown("Clean UI • Multi-step forecasting • LSTM optional")
-
-section = st.sidebar.radio("Navigate to:", ["Home", "Visualizations", "Predictions", "Model Info", "About"])
-
-ticker_input = st.sidebar.text_input("Ticker (Yahoo)", value="AAPL").upper()
-period = st.sidebar.selectbox("History Period", ["6mo", "1y", "2y", "5y"], index=2)
-interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
-window = st.sidebar.slider("Window (days) for model", 5, 60, 20)
-n_steps = st.sidebar.slider("Forecast horizon (days)", 1, 30, 7)
-method = st.sidebar.selectbox("Forecast method", ["Recursive"], index=0)
-use_lstm_if_available = st.sidebar.checkbox("Use TensorFlow LSTM if available", value=True)
-
-
-# ---------- Sections ----------
-# HOME
-if section == "Home":
-    st.title("📉 Stock Prediction Dashboard")
-    st.markdown("""
-    This app fetches historical stock data, shows interactive visualizations,
-    and produces short-term forecasts. It supports both classical ML models
-    (joblib) and TensorFlow LSTM if available.
-    """)
-
-    df = fetch_history(ticker_input, period, interval)
-
-    if df.empty:
-        st.error(f"No data found for {ticker_input}. Check ticker symbol or Yahoo may be blocking requests.")
-    else:
-        st.subheader(f"{ticker_input} Recent Prices")
-        st.dataframe(df.tail())
-
-        fig = px.line(df, x="Date", y="Close", title=f"{ticker_input} Closing Price")
+    # show price history
+    st.subheader(f"Price history for {ticker.upper()} (last {history_years} years)")
+    price_col, ind_col = st.columns([2,1])
+    with price_col:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close'))
+        fig.update_layout(title=f"{ticker.upper()} Close Price", xaxis_title="Date", yaxis_title="Price", height=400)
         st.plotly_chart(fig, use_container_width=True)
 
+    # indicators
+    data = make_indicators(data)
+    with ind_col:
+        st.write("Latest indicators")
+        st.write(data[['Close','EMA20','EMA50','RSI','MACD','MACDsig']].tail(3))
 
-# VISUALIZATIONS
-elif section == "Visualizations":
-    st.header("📊 Visualizations")
-    df = fetch_history(ticker_input, period, interval)
-
-    if df.empty:
-        st.error("No data to visualize.")
-    else:
-        fig = px.line(df, x="Date", y="Close", title="Close Price")
-        st.plotly_chart(fig, use_container_width=True)
-
-        df["MA20"] = df["Close"].rolling(20).mean()
-        df["MA50"] = df["Close"].rolling(50).mean()
-
-        fig2 = px.line(df, x="Date", y=["Close", "MA20", "MA50"], title="Moving Averages")
-        st.plotly_chart(fig2, use_container_width=True)
-
-
-# PREDICTIONS
-elif section == "Predictions":
-    st.header("🔮 Predictions")
-
-    df = fetch_history(ticker_input, period, interval)
-    if df.empty:
-        st.error("Cannot predict — no data found.")
-    else:
-        series = df["Close"]
-        X, X_lstm, y, scaler = prepare_series_for_model(series, window)
-
-        # Load models
-        joblib_model = load_joblib_model("stock_model.joblib")
-        tf_model = load_tf_model("lstm_model.h5") if (use_lstm_if_available and TENSORFLOW_AVAILABLE) else None
-
-        model = tf_model if tf_model else joblib_model
-        is_lstm = tf_model is not None
-
-        if model is None:
-            st.error("No model found: upload stock_model.joblib or lstm_model.h5")
+    # -----------------------
+    # Keep your existing classifier prediction (unchanged)
+    # -----------------------
+    try:
+        if os.path.exists(CLASSIFIER_MODEL_PATH):
+            clf = joblib.load(CLASSIFIER_MODEL_PATH)
+            feat = data[['EMA20','EMA50','MACD','MACDsig','RSI']].dropna().tail(1)
+            if feat.shape[0] == 1:
+                pred = clf.predict(feat)[0]
+                st.subheader("Classifier (existing) - Current direction")
+                st.success(" Bullish (UP)" if pred == 1 else "Bearish (DOWN)")
+            #else:
+                #st.warning("Not enough rows to feed classifier features.")
         else:
-            last_window_scaled = X_lstm[-1].reshape(-1) if is_lstm else X[-1]
+            st.warning("Classifier model not found — skipping classifier prediction.")
+    except Exception as e:
+        st.error(f"Error loading classifier model: {e}")
 
-            preds = recursive_forecast(last_window_scaled, model, scaler, steps=n_steps, is_lstm=is_lstm)
-            future_dates = [df["Date"].max() + timedelta(days=i+1) for i in range(n_steps)]
+    # -----------------------
+    # LSTM Forecasting
+    # -----------------------
+    if tf is None:
+        st.error("TensorFlow not available. Install tensorflow in your environment to use LSTM forecasting.")
+        st.stop()
 
-            pred_df = pd.DataFrame({"Date": future_dates, "Predicted": preds})
-            st.write(pred_df)
+    st.subheader(f"LSTM Forecast — next {forecast_days} days")
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df["Date"], y=df["Close"], mode="lines", name="History"))
-            fig.add_trace(go.Scatter(x=future_dates, y=preds, mode="lines+markers", name="Forecast"))
-            fig.update_layout(title=f"{ticker_input} {n_steps}-Day Forecast", height=450)
-            st.plotly_chart(fig, use_container_width=True)
+    # Prepare data for LSTM (use 'Close' prices)
+    close_vals = data[['Close']].values  # shape (n,1)
+    scaler = MinMaxScaler()
+    scaled_close = scaler.fit_transform(close_vals)
 
+    lookback = 60
+    if len(scaled_close) < lookback + 10:
+        st.error(f"Not enough historical data for LSTM (need at least {lookback+10} days). Increase history length.")
+        st.stop()
 
-# MODEL INFO
-elif section == "Model Info":
-    st.header("📘 Model Info")
+    X, y = create_sequences(scaled_close, lookback=lookback)
 
-    st.write(f"TensorFlow available: {TENSORFLOW_AVAILABLE}")
-    st.write(f"LSTM model exists: {os.path.exists('lstm_model.h5')}")
-    st.write(f"Joblib model exists: {os.path.exists('stock_model.joblib')}")
+    # train or load model
+    model = None
+    model_msg = ""
+    if os.path.exists(LSTM_MODEL_PATH) and not retrain:
+        try:
+            model = load_model(LSTM_MODEL_PATH)
+            model_msg = f"Loaded saved LSTM model from {LSTM_MODEL_PATH}"
+        except Exception as e:
+            st.warning(f"Could not load saved LSTM model (will train fresh): {e}")
+            model = None
 
+    if model is None:
+        # Train model (simple, short training by default)
+        st.info("Training LSTM model. This may take a few moments depending on environment.")
+        model = build_lstm(lookback=lookback)
+        epochs = 15
+        batch_size = 16
 
-# ABOUT
-elif section == "About":
-    st.header("ℹ️ About this App")
-    st.markdown("""
-    Made with ❤️ for learning stock forecasting.
-    Features multi-step forecasting, a clean UI, and joblib/LSTM support.
-    """)
+        # callbacks
+        cb_list = []
+        ckpt_path = os.path.join(BASE_DIR, "lstm_checkpoint.h5")
+        cb_list.append(EarlyStopping(monitor='loss', patience=4, restore_best_weights=True))
+        cb_list.append(ModelCheckpoint(ckpt_path, save_best_only=True, monitor='loss', verbose=0))
 
-st.markdown("<hr><center>Built with Streamlit • GitHub: darshanraj11412</center>", unsafe_allow_html=True)
+        # Fit
+        with st.spinner("Fitting LSTM..."):
+            history = model.fit(X, y, epochs=epochs, batch_size=batch_size, callbacks=cb_list, verbose=0)
+        # save model
+        try:
+            model.save(LSTM_MODEL_PATH)
+            model_msg = f"Trained and saved LSTM model to {LSTM_MODEL_PATH}"
+        except Exception as e:
+            model_msg = f"Trained LSTM but failed to save model: {e}"
+
+    st.write(model_msg)
+
+    # Prepare last sequence and forecast iteratively
+    last_seq = scaled_close[-lookback:]  # shape (lookback, 1)
+    preds = iterative_forecast(model, last_seq, scaler, forecast_days, lookback=lookback)
+
+    # Build forecast df
+    future_dates = pd.date_range(start=data.index[-1] + pd.Timedelta(days=1), periods=forecast_days)
+    forecast_df = pd.DataFrame({"Date": future_dates, "Predicted_Close": preds})
+    forecast_df.set_index("Date", inplace=True)
+
+    # combine history + forecast for plotting
+    combined = pd.concat([data['Close'], forecast_df['Predicted_Close']])
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Historical Close'))
+    fig2.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df['Predicted_Close'], mode='lines+markers', name='LSTM Forecast'))
+    fig2.update_layout(title=f"{ticker.upper()} — Historical + LSTM Forecast", xaxis_title="Date", yaxis_title="Price", height=450)
+    st.plotly_chart(fig2, use_container_width=True)
+
+    st.subheader("Forecast Table")
+    st.write(forecast_df)
+
+    # Final decision: average future vs last price
+    last_price = float(data['Close'].iloc[-1])
+    avg_future = float(forecast_df['Predicted_Close'].mean())
+
+    if avg_future > last_price:
+        st.success(f" LSTM expects upside (Current: {last_price:.2f} → Avg Future: {avg_future:.2f})")
+    else:
+        st.error(f" LSTM expects downside (Current: {last_price:.2f} → Avg Future: {avg_future:.2f})")
+
+    # Optional: show the MSE on the training tail for basic sanity check
+    # compute simple one-step validation MSE on last portion if available
+    try:
+        # use last 20% as quick validation if dataset big enough
+        split = int(len(X)*0.8)
+        if split < len(X)-5:
+            X_val, y_val = X[split:], y[split:]
+            y_pred_val = model.predict(X_val, verbose=0).flatten()
+            y_pred_val = scaler.inverse_transform(y_pred_val.reshape(-1,1)).flatten()
+            y_val_true = scaler.inverse_transform(y_val.reshape(-1,1)).flatten()
+            mse = np.mean((y_pred_val - y_val_true)**2)
+            st.info(f"Validation MSE (one-step) ≈ {mse:.4f}")
+    except Exception:
+        pass
+
+    st.write(" Forecast complete! For more accurate results, try using more historical data or training the model longer.")
